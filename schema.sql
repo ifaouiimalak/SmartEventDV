@@ -57,3 +57,13 @@ INSERT IGNORE INTO promo_codes (code, discount_type, discount_value, min_amount,
 ('ETE2026',    'percent', 15,  50,     200,  '2026-06-01', '2026-08-31'),
 ('FLAT20DT',   'fixed',   20,  80,     100,  '2026-01-01', '2026-12-31'),
 ('VIP50',      'percent', 50,  200,    50,   '2026-06-01', '2026-09-30');
+-- =============================================
+-- Add Promo Code Support to reservations table
+-- =============================================
+
+ALTER TABLE reservations
+    ADD COLUMN IF NOT EXISTS promo_code_id   INT          NULL AFTER quantity,
+    ADD COLUMN IF NOT EXISTS discount_amount DECIMAL(10,2) DEFAULT 0 AFTER promo_code_id,
+    ADD COLUMN IF NOT EXISTS final_price     DECIMAL(10,2) DEFAULT NULL AFTER discount_amount,
+    ADD FOREIGN KEY IF NOT EXISTS fk_res_promo (promo_code_id) 
+        REFERENCES promo_codes(id) ON DELETE SET NULL;

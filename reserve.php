@@ -7,6 +7,7 @@ if (!isset($_SESSION['user'])) {
 }
 
 $id = (int) ($_GET['id'] ?? 0);
+
 $stmt = $pdo->prepare("SELECT e.*, c.name AS category, c.icon,
                         COALESCE(SUM(CASE WHEN r.status <> 'annulee' THEN r.quantity ELSE 0 END), 0) AS reserved
                        FROM events e
@@ -27,7 +28,7 @@ $remaining = max(0, (int) $event['places'] - (int) $event['reserved']);
 $error     = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $quantity   = max(1, (int) $_POST['quantity']);
+    $quantity   = max(1, (int) ($_POST['quantity'] ?? 1));
     $promoCode  = strtoupper(trim($_POST['promo_code'] ?? ''));
     $promoId    = null;
     $discount   = 0.00;
@@ -36,15 +37,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($quantity > $remaining) {
         $error = 'Nombre de places insuffisant.';
     } else {
-        // Re-validate promo server-side (don't trust client JS)
+        $subtotal = round((float)$event['price'] * $quantity, 2);
+
+        // Re-validate promo server-side
         if ($promoCode !== '') {
-            $subtotal = round((float)$event['price'] * $quantity, 2);
             $pStmt = $pdo->prepare("SELECT * FROM promo_codes WHERE code = ? AND is_active = 1");
             $pStmt->execute([$promoCode]);
             $promo = $pStmt->fetch();
 
             $today = date('Y-m-d');
             $userId = (int) $_SESSION['user']['id'];
+
             $promoValid = $promo
                 && (!$promo['valid_from']  || $today >= $promo['valid_from'])
                 && (!$promo['valid_until'] || $today <= $promo['valid_until'])
@@ -52,7 +55,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 && $subtotal >= (float)$promo['min_amount'];
 
             if ($promoValid) {
-                // Check user hasn't used it before
+                // Check if user already used this promo
                 $puStmt = $pdo->prepare("SELECT id FROM promo_uses WHERE promo_id = ? AND user_id = ?");
                 $puStmt->execute([$promo['id'], $userId]);
                 if ($puStmt->fetch()) {
@@ -75,19 +78,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if (!$error) {
-            $subtotal   = round((float)$event['price'] * $quantity, 2);
             $finalPrice = $finalPrice ?? $subtotal;
 
-            $pdo->prepare("INSERT INTO reservations(user_id, event_id, quantity, promo_code_id, discount_amount, final_price)
-                           VALUES(?, ?, ?, ?, ?, ?)")
-                ->execute([$_SESSION['user']['id'], $id, $quantity, $promoId, $discount, $finalPrice]);
+            // === MAIN INSERT ===
+            $stmt = $pdo->prepare("INSERT INTO reservations 
+                (user_id, event_id, quantity, promo_code_id, discount_amount, final_price, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'en_attente')");
+
+            $stmt->execute([
+                $_SESSION['user']['id'],
+                $id,
+                $quantity,
+                $promoId,
+                $discount,
+                $finalPrice
+            ]);
 
             $reservationId = (int) $pdo->lastInsertId();
 
-            // Record promo usage & increment counter
+            // Record promo usage
             if ($promoId) {
-                $pdo->prepare("INSERT INTO promo_uses(promo_id, user_id, reservation_id) VALUES(?, ?, ?)")
+                $pdo->prepare("INSERT INTO promo_uses (promo_id, user_id, reservation_id) 
+                               VALUES (?, ?, ?)")
                     ->execute([$promoId, $_SESSION['user']['id'], $reservationId]);
+
                 $pdo->prepare("UPDATE promo_codes SET used_count = used_count + 1 WHERE id = ?")
                     ->execute([$promoId]);
             }
@@ -98,12 +112,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 ?>
+
 <main class="container auth-page">
     <form class="form auth-card reveal visible" method="post" id="reserveForm">
         <span class="eyebrow"><?= htmlspecialchars(($event['icon'] ?? '✨') . ' ' . ($event['category'] ?? 'Événement')) ?></span>
         <h2><?= htmlspecialchars($event['title']) ?></h2>
 
-        <?php if ($error): ?><div class="alert error"><?= htmlspecialchars($error) ?></div><?php endif; ?>
+        <?php if ($error): ?>
+            <div class="alert error"><?= htmlspecialchars($error) ?></div>
+        <?php endif; ?>
 
         <img class="detail-img" src="<?= htmlspecialchars(eventImage($event['image'])) ?>" alt="">
         <p class="muted"><?= htmlspecialchars($event['description']) ?></p>
@@ -119,7 +136,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <input type="number" name="quantity" id="quantityInput"
                value="1" min="1" max="<?= $remaining ?>" required>
 
-        <!-- Price display -->
+        <!-- Price breakdown -->
         <div class="price-breakdown" id="priceBreakdown"
              style="background:var(--surface2);border-radius:12px;padding:1rem 1.2rem;margin:.5rem 0">
             <div style="display:flex;justify-content:space-between;margin-bottom:.3rem">
@@ -153,9 +170,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
         <div id="promoMsg" style="margin-top:.4rem;font-size:.88rem;min-height:1.2em"></div>
 
-        <!-- Hidden fields for server-side confirmation -->
-        <input type="hidden" name="promo_code" id="promoHidden" value="">
-
         <button class="btn success" <?= $remaining === 0 ? 'disabled' : '' ?>
                 style="margin-top:.8rem">Confirmer la réservation</button>
     </form>
@@ -168,10 +182,8 @@ const maxPlaces   = <?= $remaining ?>;
 
 const qtyInput    = document.getElementById('quantityInput');
 const promoInput  = document.getElementById('promoInput');
-const promoHidden = document.getElementById('promoHidden');
 const promoBtn    = document.getElementById('promoBtn');
 const promoMsg    = document.getElementById('promoMsg');
-
 const subtotalEl  = document.getElementById('subtotalDisplay');
 const discountRow = document.getElementById('discountRow');
 const discountEl  = document.getElementById('discountDisplay');
@@ -184,24 +196,24 @@ function fmt(n) {
 }
 
 function updatePrices() {
-    const qty      = Math.max(1, parseInt(qtyInput.value)||1);
+    const qty      = Math.max(1, parseInt(qtyInput.value) || 1);
     const subtotal = unitPrice * qty;
     const total    = Math.max(0, subtotal - appliedDiscount);
+    
     subtotalEl.textContent = fmt(subtotal);
     totalEl.textContent    = fmt(total);
+    
     if (appliedDiscount > 0) {
         discountRow.style.display = 'flex';
-        discountEl.textContent   = '-' + fmt(appliedDiscount);
+        discountEl.textContent = '-' + fmt(appliedDiscount);
     } else {
         discountRow.style.display = 'none';
     }
 }
 
 qtyInput.addEventListener('input', () => {
-    // Reset promo when quantity changes (discount needs re-validation)
     if (appliedDiscount > 0) {
         appliedDiscount = 0;
-        promoHidden.value = '';
         promoMsg.textContent = 'Quantité modifiée — veuillez réappliquer le code promo.';
         promoMsg.style.color = 'var(--muted)';
     }
@@ -210,53 +222,54 @@ qtyInput.addEventListener('input', () => {
 
 promoBtn.addEventListener('click', async () => {
     const code = promoInput.value.trim().toUpperCase();
-    if (!code) { promoMsg.textContent = 'Entrez un code promo.'; promoMsg.style.color='var(--muted)'; return; }
+    if (!code) {
+        promoMsg.textContent = 'Entrez un code promo.';
+        promoMsg.style.color = 'var(--muted)';
+        return;
+    }
 
-    promoBtn.disabled    = true;
+    promoBtn.disabled = true;
     promoBtn.textContent = '...';
     promoMsg.textContent = '';
 
-    const qty = Math.max(1, parseInt(qtyInput.value)||1);
+    const qty = Math.max(1, parseInt(qtyInput.value) || 1);
     const fd  = new FormData();
-    fd.append('code',     code);
+    fd.append('code', code);
     fd.append('event_id', eventId);
     fd.append('quantity', qty);
 
     try {
-        const resp = await fetch('promo_check.php', { method:'POST', body:fd });
+        const resp = await fetch('promo_check.php', { method: 'POST', body: fd });
         const data = await resp.json();
 
         if (data.valid) {
-            appliedDiscount   = data.discount_amount;
-            promoHidden.value = code;
+            appliedDiscount = data.discount_amount;
             promoMsg.textContent = '✓ ' + data.message;
             promoMsg.style.color = '#22c55e';
-            promoInput.readOnly  = true;
+            promoInput.readOnly = true;
             promoBtn.textContent = '✓';
         } else {
-            appliedDiscount      = 0;
-            promoHidden.value    = '';
+            appliedDiscount = 0;
             promoMsg.textContent = '✗ ' + data.message;
             promoMsg.style.color = '#ef4444';
-            promoBtn.disabled    = false;
+            promoBtn.disabled = false;
             promoBtn.textContent = 'Appliquer';
         }
         updatePrices();
-    } catch {
+    } catch (e) {
         promoMsg.textContent = 'Erreur réseau.';
         promoMsg.style.color = '#ef4444';
-        promoBtn.disabled    = false;
+        promoBtn.disabled = false;
         promoBtn.textContent = 'Appliquer';
     }
 });
 
-// Allow resetting promo
+// Reset promo when user types again
 promoInput.addEventListener('input', () => {
     if (promoInput.readOnly) {
-        promoInput.readOnly  = false;
-        appliedDiscount      = 0;
-        promoHidden.value    = '';
-        promoBtn.disabled    = false;
+        promoInput.readOnly = false;
+        appliedDiscount = 0;
+        promoBtn.disabled = false;
         promoBtn.textContent = 'Appliquer';
         promoMsg.textContent = '';
         updatePrices();
